@@ -463,3 +463,55 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
+# === DEBUG COMMANDS ===
+
+@bot_client.on(events.NewMessage(pattern=r'^/debug_status$'))
+async def cmd_debug_status(event):
+    st = load_state()
+    if not is_owner(st, event.sender_id):
+        return await event.respond("Только владелец может управлять.")
+    await event.respond(
+        "DEBUG:\n"
+        f"- enabled={st.get('enabled')}\n"
+        f"- ALLOW_IDS={sorted(ALLOW_IDS) if ALLOW_IDS else 'ALL'}\n"
+        f"- reply_len={len((st.get('reply_text') or DEFAULT_REPLY))}\n"
+    )
+
+@bot_client.on(events.NewMessage(pattern=r'^/debug_test_send\s+(\S+)$'))
+async def cmd_debug_test_send(event):
+    """Пробная отправка текущего шаблона отклика на указанный @username или числовой id."""
+    st = load_state()
+    if not is_owner(st, event.sender_id):
+        return await event.respond("Только владелец может управлять.")
+    target = event.pattern_match.group(1)
+    try:
+        if target.startswith("@"):
+            to = target
+        elif target.isdigit():
+            to = int(target)
+        else:
+            return await event.respond("Формат: /debug_test_send @username ИЛИ /debug_test_send <user_id>")
+        await user_client.send_message(to, st.get("reply_text") or DEFAULT_REPLY)
+        await event.respond(f"✅ Тестовое ЛС отправлено → {to}")
+    except Exception as e:
+        await event.respond(f"❌ Ошибка отправки: {e}")
+
+@bot_client.on(events.NewMessage(pattern=r'^/debug_test_text\s+([\s\S]+)$'))
+async def cmd_debug_test_text(event):
+    """Прогон строки через ключи+негативы и Gemini, вернуть вердикт."""
+    st = load_state()
+    if not is_owner(st, event.sender_id):
+        return await event.respond("Только владелец может управлять.")
+    text = norm(event.pattern_match.group(1))
+    pos = positive_by_keywords(text)
+    neg = negative_by_keywords(text)
+    gmi = await gemini_relevant(text)
+    verdict = (pos and not neg) or (not (pos and not neg) and gmi)
+    await event.respond(
+        "Проверка текста:\n"
+        f"- positive_by_keywords={pos}\n"
+        f"- negative_by_keywords={neg}\n"
+        f"- gemini={gmi}\n"
+        f"- FINAL={verdict}"
+    )
+
