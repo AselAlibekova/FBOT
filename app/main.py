@@ -116,6 +116,10 @@ def norm(s: str) -> str:
     s = (s or "").replace("ё", "е")
     return re.sub(r"\s+", " ", s).strip()
 
+# Нормализация chat_id/канального id: делаем положительным (убираем -100)
+def sid(x: int) -> int:
+    return abs(int(x))
+
 # -------- Восстановление user.session из ENV (если нужно) --------
 def maybe_restore_user_session_from_b64():
     if not TELETHON_SESSION_B64:
@@ -185,7 +189,6 @@ async def gemini_relevant(text: str) -> bool:
         )
         resp = gemini_model.generate_content(prompt)
         raw = (getattr(resp, "text", None) or "").strip()
-        # Быстрый парс JSON
         try:
             j = json.loads(raw)
             return bool(j.get("relevant") is True)
@@ -208,7 +211,7 @@ def _normalize_channel_link(x: str) -> str:
     return x
 
 async def resolve_channels():
-    """Резолвит ссылки/юзернеймы из state → ALLOW_IDS."""
+    """Резолвит ссылки/юзернеймы из state → ALLOW_IDS (нормализованные id)."""
     global ALLOW_IDS
     async with RESOLVE_LOCK:
         st = load_state()
@@ -224,7 +227,7 @@ async def resolve_channels():
                 uname = link.split("https://t.me/")[-1].strip("/")
             try:
                 ent = await user_client.get_entity(uname)
-                ids.append(ent.id)
+                ids.append(sid(ent.id))  # ключевой фикс: нормализуем id
                 title = getattr(ent, "title", None) or getattr(ent, "username", None) or str(ent.id)
                 log.info(f"Resolved: {link} → id={ent.id} | {ent.__class__.__name__} | {title}")
             except Exception as e:
@@ -240,7 +243,7 @@ async def watcher(event):
         st = load_state()
         if not st.get("enabled"):
             return
-        if ALLOW_IDS and (event.chat_id not in ALLOW_IDS):
+        if ALLOW_IDS and (sid(event.chat_id) not in ALLOW_IDS):  # фикс сравнения
             return
 
         raw = event.raw_text or ""
@@ -364,8 +367,7 @@ def _split_links(s: str) -> List[str]:
         if it.startswith("@") or it.startswith("https://t.me/"):
             out.append(_normalize_channel_link(it))
         else:
-            # голое имя канала без @ — допустим
-            if re.fullmatch(r"[A-Za-z0-9_]{4,32}", it):
+            if re.fullmatch(r"[A-Za-z0-9_]{4,32}", it):  # голое имя канала
                 out.append("https://t.me/" + it)
     return out
 
