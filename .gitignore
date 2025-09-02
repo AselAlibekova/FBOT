@@ -1,6 +1,5 @@
 # secrets & runtime
-.env
-*.env
+
 data/
 .sessions/
 *.session
