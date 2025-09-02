@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Управление и мониторинг — всё на Telethon:
-- bot_client: подключается по BOT_TOKEN, принимает команды /start /on /off /add_channel /list_channels /remove_channel /set_reply /status
-- user_client: подключается как обычный аккаунт, мониторит каналы и шлёт ЛС
-- ключевые слова + fallback на Gemini (опционально)
+Управляющий бот + сканер каналов на Telethon.
+- bot_client: Telegram bot по BOT_TOKEN (команды /start /on /off /add_channel /list_channels /remove_channel /set_reply /status /whoami)
+- user_client: обычный аккаунт (api_id/api_hash) слушает каналы и шлёт ЛС контактам
+- Ключевые слова + fallback на Gemini (google-generativeai)
 """
 
 import os, re, json, random, asyncio, logging, base64, pathlib
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Set
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
@@ -16,32 +16,31 @@ from telethon.errors.rpcerrorlist import (
     ChatWriteForbiddenError, UserIsBlockedError, UserPrivacyRestrictedError
 )
 
-# === Gemini (опц.) ===
-GEMINI_AVAILABLE = False
-try:
-    import google.generativeai as genai
-    GEMINI_AVAILABLE = True
-except Exception:
-    GEMINI_AVAILABLE = False
+# -------- Gemini --------
+import google.generativeai as genai
 
-# ------------------ Конфиг ------------------
+# -------- Конфиг/ENV --------
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
-API_HASH = os.getenv("TELEGRAM_API_HASH", "").strip()
+BOT_TOKEN  = os.getenv("BOT_TOKEN", "").strip()
+API_ID     = int(os.getenv("TELEGRAM_API_ID", "0"))
+API_HASH   = os.getenv("TELEGRAM_API_HASH", "").strip()
 
 STATE_FILE   = os.getenv("STATE_FILE", "./data/state.json")
 SESSIONS_DIR = os.getenv("SESSIONS_DIR", "./.sessions")
-USER_SESSION = os.getenv("SESSION_NAME", "user.session")     # юзер-сессия
-BOT_SESSION  = os.getenv("BOT_SESSION_NAME", "bot.session")  # сессия бота (не обязательно)
+USER_SESSION = os.getenv("SESSION_NAME", "user.session")
+BOT_SESSION  = os.getenv("BOT_SESSION_NAME", "bot.session")
 
-# Восстановление юзер-сессии из ENV (для Pella)
 TELETHON_SESSION_B64 = os.getenv("TELETHON_SESSION_B64", "").strip()
 
 MIN_DELAY = max(0, int(os.getenv("MIN_DELAY", "1")))
 MAX_DELAY = max(MIN_DELAY, int(os.getenv("MAX_DELAY", "15")))
 VERBOSE   = os.getenv("VERBOSE", "0").lower() in {"1","true","yes"}
+
+# Админы (через запятую): ADMIN_IDS=111,222
+ADMIN_IDS: Set[int] = {
+    int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.isdigit()
+}
 
 DEFAULT_REPLY = (
     "Привет!\n\n"
@@ -55,17 +54,18 @@ DEFAULT_REPLY = (
 
 KEYWORDS = [s.strip().lower() for s in os.getenv(
     "KEYWORDS",
-    "анимация,motion,моушн,2d,3d,видео,монтаж,rig,rigging,explainer,runway,midjourney,blender,c4d,cinema 4d,after effects,ae"
+    "анимация,motion,моушн,2d,3d,видео,монтаж,rig,rigging,explainer,runway,midjourney,blender,c4d,cinema 4d,after effects,ae,ai,ai creator,creator,креатор,моушн дизайнер,аниматор,анимации,графика"
 ).split(",") if s.strip()]
 
 NEGATIVE_WORDS = [s.strip().lower() for s in os.getenv(
     "NEGATIVE_WORDS",
-    "ищу работу,исполнитель,портфолио,стажировка,готов выполн,резюме"
+    "ищу работу,исполнитель,портфолио,стажировка,готов выполн,резюме,ищу заказы,ищу клиентов,выполню,сделаю,предлагаю услуги"
 ).split(",") if s.strip()]
 
-GEMINI_ENABLED = os.getenv("GEMINI_ENABLED","0").lower() in {"1","true","yes"} and GEMINI_AVAILABLE and bool(os.getenv("GEMINI_API_KEY","").strip())
-GEMINI_MODEL   = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY","").strip()
+# Gemini
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL   = os.getenv("GEMINI_MODEL", "gemini-1.5-flash").strip()
+GEMINI_ENABLED = os.getenv("GEMINI_ENABLED", "0").lower() in {"1", "true", "yes"} and bool(GEMINI_API_KEY)
 
 logging.basicConfig(
     level=logging.DEBUG if VERBOSE else logging.INFO,
@@ -74,13 +74,13 @@ logging.basicConfig(
 )
 log = logging.getLogger("motionbot")
 
-# ------------------ Утилиты состояния ------------------
+# -------- Состояние --------
 state_lock = asyncio.Lock()
 STATE_DEFAULT: Dict[str, Any] = {
     "enabled": False,
-    "channels": [],             # ссылки/юзернеймы каналов
+    "channels": [],
     "reply_text": DEFAULT_REPLY,
-    "owner_id": 0               # сюда слать отчёты
+    "owner_id": 0
 }
 
 def ensure_dirs():
@@ -94,8 +94,8 @@ def load_state() -> Dict[str, Any]:
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        for k,v in STATE_DEFAULT.items():
-            data.setdefault(k,v)
+        for k, v in STATE_DEFAULT.items():
+            data.setdefault(k, v)
         return data
     except Exception as e:
         log.warning(f"state load failed: {e}")
@@ -109,14 +109,14 @@ async def save_state(st: Dict[str, Any]):
     os.replace(tmp, STATE_FILE)
 
 def preview(s: str, n=160):
-    s = (s or "").replace("\n"," ")
+    s = (s or "").replace("\n", " ")
     return (s[:n] + "…") if len(s) > n else s
 
 def norm(s: str) -> str:
-    s = (s or "").replace("ё","е")
-    return re.sub(r"\s+"," ",s).strip()
+    s = (s or "").replace("ё", "е")
+    return re.sub(r"\s+", " ", s).strip()
 
-# ------------------ восстановление user.session из ENV ------------------
+# -------- Восстановление user.session из ENV (если нужно) --------
 def maybe_restore_user_session_from_b64():
     if not TELETHON_SESSION_B64:
         return
@@ -130,7 +130,7 @@ def maybe_restore_user_session_from_b64():
     except Exception as e:
         log.error(f"Restore session failed: {e}")
 
-# ------------------ Клиенты ------------------
+# -------- Клиенты --------
 if not API_ID or not API_HASH:
     raise SystemExit("TELEGRAM_API_ID/TELEGRAM_API_HASH required in .env")
 if not BOT_TOKEN:
@@ -139,11 +139,11 @@ if not BOT_TOKEN:
 ensure_dirs()
 maybe_restore_user_session_from_b64()
 
-user_session_path = str(pathlib.Path(SESSIONS_DIR)/USER_SESSION)
-bot_session_path  = str(pathlib.Path(SESSIONS_DIR)/BOT_SESSION)
+user_session_path = str(pathlib.Path(SESSIONS_DIR) / USER_SESSION)
+bot_session_path  = str(pathlib.Path(SESSIONS_DIR) / BOT_SESSION)
 
-user_client = TelegramClient(user_session_path, API_ID, API_HASH)          # юзер
-bot_client  = TelegramClient(bot_session_path,  API_ID, API_HASH)          # бот
+user_client = TelegramClient(user_session_path, API_ID, API_HASH)
+bot_client  = TelegramClient(bot_session_path,  API_ID, API_HASH)
 
 # Gemini init
 if GEMINI_ENABLED:
@@ -155,12 +155,14 @@ if GEMINI_ENABLED:
         GEMINI_ENABLED = False
         log.warning(f"Gemini init failed → disabled: {e}")
 
-# ------------------ Фильтры ------------------
+# -------- Фильтры --------
+HIRE_RX = re.compile(r"(ищу|ищем|нужен|нужна|нужны|требуется|ваканси|в\s*поиск|на\s*проект|задача)", re.I)
+
 def positive_by_keywords(text: str) -> bool:
     t = text.lower()
     if not any(k in t for k in KEYWORDS):
         return False
-    if not re.search(r"(ищу|ищем|нужен|нужна|нужны|требуется|ваканси|в\s*поиск|на\s*проект|задача)", t):
+    if not HIRE_RX.search(t):
         return False
     return True
 
@@ -169,35 +171,53 @@ def negative_by_keywords(text: str) -> bool:
     return any(n in t for n in NEGATIVE_WORDS)
 
 async def gemini_relevant(text: str) -> bool:
+    """Строгая классификация через Gemini с JSON-ответом."""
     if not GEMINI_ENABLED:
         return False
     try:
         prompt = (
-            "Classify Telegram posts in RU/EN as HIRE_REQUEST or NOT for motion/2D/3D/animation jobs.\n"
-            "Return ONLY TRUE or FALSE.\n\n"
-            f"Text:\n{text}"
+            "Ты модератор вакансий по motion/2D/3D/анимации.\n"
+            "Классифицируй текст как ЗАПРОС ИСПОЛНИТЕЛЯ (клиент ищет специалиста) или НЕТ.\n"
+            "Важно: не считать релевантным, если автор сам ищет заказ/работу.\n"
+            "Ответ строго в JSON без пояснений, на одной строке:\n"
+            '{"relevant": true}  или  {"relevant": false}\n\n'
+            f"Текст: \"\"\"{text}\"\"\""
         )
         resp = gemini_model.generate_content(prompt)
-        out = (resp.text or "").strip().upper()
-        return "TRUE" in out and "FALSE" not in out
+        raw = (getattr(resp, "text", None) or "").strip()
+        # Быстрый парс JSON
+        try:
+            j = json.loads(raw)
+            return bool(j.get("relevant") is True)
+        except Exception:
+            return bool(re.search(r'"relevant"\s*:\s*true', raw, re.I))
     except Exception as e:
         log.warning(f"Gemini error: {e}")
         return False
 
-# ------------------ Разрешённые каналы ------------------
-ALLOW_IDS: set[int] = set()
+# -------- Разрешённые каналы --------
+ALLOW_IDS: Set[int] = set()
 RESOLVE_LOCK = asyncio.Lock()
 
+def _normalize_channel_link(x: str) -> str:
+    x = x.strip()
+    if not x:
+        return ""
+    if x.startswith("@"):
+        x = "https://t.me/" + x[1:]
+    return x
+
 async def resolve_channels():
+    """Резолвит ссылки/юзернеймы из state → ALLOW_IDS."""
     global ALLOW_IDS
     async with RESOLVE_LOCK:
         st = load_state()
-        channels = st.get("channels") or []
+        channels: List[str] = st.get("channels") or []
         if not channels:
             ALLOW_IDS = set()
             log.warning("CHANNELS пуст — слушаем всё (только логируем chat_id/title).")
             return
-        ids = []
+        ids: List[int] = []
         for link in channels:
             uname = link
             if link.startswith("https://t.me/"):
@@ -212,7 +232,7 @@ async def resolve_channels():
         ALLOW_IDS = set(ids)
         log.info(f"Listening IDs: {sorted(ALLOW_IDS)}")
 
-# ------------------ Мониторинг новых сообщений (юзер-клиент) ------------------
+# -------- Монитор новых сообщений --------
 @user_client.on(events.NewMessage)
 async def watcher(event):
     key = f"{event.chat_id}:{event.id}"
@@ -267,7 +287,9 @@ async def watcher(event):
             if st.get("owner_id"):
                 src = chat_title or str(event.chat_id)
                 who = target if isinstance(target, str) else f"id:{target}"
-                asyncio.create_task(bot_client.send_message(st["owner_id"], f"✅ Отклик отправлен {who} (источник: {src})"))
+                asyncio.create_task(
+                    bot_client.send_message(st["owner_id"], f"✅ Отклик отправлен {who} (источник: {src})")
+                )
         except FloodWaitError as e:
             log.warning(f"[{key}] FloodWait {e.seconds}s")
         except (UserPrivacyRestrictedError, UserIsBlockedError):
@@ -280,12 +302,13 @@ async def watcher(event):
     except Exception as e:
         log.exception(f"[{key}] handler error: {e}")
 
-# ------------------ Команды бота (bot_client) ------------------
+# -------- Команды бота --------
 def is_owner(st: Dict[str, Any], user_id: int) -> bool:
     owner = int(st.get("owner_id") or 0)
-    return owner == 0 or owner == user_id  # 0 → первый /start назначит владельца
+    # владельцем считается первый /start, но админы тоже могут управлять
+    return (user_id in ADMIN_IDS) or owner == 0 or owner == user_id
 
-@bot_client.on(events.NewMessage(pattern=r'^/start'))
+@bot_client.on(events.NewMessage(pattern=r'^/start$'))
 async def cmd_start(event):
     st = load_state()
     if st.get("owner_id") in (0, None):
@@ -297,13 +320,18 @@ async def cmd_start(event):
         "Команды:\n"
         "/on — включить\n"
         "/off — выключить\n"
-        "/add_channel <ссылка или @username>\n"
+        "/add_channel <ссылки или @username через пробел/переносы>\n"
         "/list_channels — список\n"
         "/remove_channel <номер>\n"
         "/set_reply <текст> — шаблон отклика\n"
         "/status — состояние\n"
+        "/whoami — показать ваш user_id\n"
     )
     await event.respond(txt)
+
+@bot_client.on(events.NewMessage(pattern=r'^/whoami$'))
+async def cmd_whoami(event):
+    await event.respond(f"Ваш user_id: {event.sender_id}")
 
 @bot_client.on(events.NewMessage(pattern=r'^/on$'))
 async def cmd_on(event):
@@ -325,19 +353,42 @@ async def cmd_off(event):
         await save_state(st)
     await event.respond("Мониторинг выключен ⏸️")
 
-@bot_client.on(events.NewMessage(pattern=r'^/add_channel\s+(.+)$'))
+def _split_links(s: str) -> List[str]:
+    # Делим по пробелам, переводам строк и запятым; фильтруем только @юзернеймы и t.me/*
+    items = re.split(r"[\s,]+", s.strip())
+    out: List[str] = []
+    for it in items:
+        it = it.strip()
+        if not it:
+            continue
+        if it.startswith("@") or it.startswith("https://t.me/"):
+            out.append(_normalize_channel_link(it))
+        else:
+            # голое имя канала без @ — допустим
+            if re.fullmatch(r"[A-Za-z0-9_]{4,32}", it):
+                out.append("https://t.me/" + it)
+    return out
+
+@bot_client.on(events.NewMessage(pattern=r'^/add_channel\s+([\s\S]+)$'))
 async def cmd_add_channel(event):
     st = load_state()
     if not is_owner(st, event.sender_id):
         return await event.respond("Только владелец может управлять.")
-    link = event.pattern_match.group(1).strip()
-    if link.startswith("@"):
-        link = "https://t.me/" + link[1:]
+    raw = event.pattern_match.group(1)
+    links = _split_links(raw)
+    if not links:
+        return await event.respond("Не нашёл ни одной ссылки/юзернейма.")
+    added = []
     async with state_lock:
-        if link not in st["channels"]:
-            st["channels"].append(link)
-            await save_state(st)
-    await event.respond(f"Добавил: {link}\nРезолвим…")
+        for link in links:
+            if link and link not in st["channels"]:
+                st["channels"].append(link)
+                added.append(link)
+        await save_state(st)
+    if added:
+        await event.respond("Добавил:\n" + "\n".join(f"- {x}" for x in added) + "\nРезолвим…")
+    else:
+        await event.respond("Все указанные каналы уже были в списке.")
     await resolve_channels()
 
 @bot_client.on(events.NewMessage(pattern=r'^/list_channels$'))
@@ -347,7 +398,7 @@ async def cmd_list_channels(event):
         return await event.respond("Только владелец может управлять.")
     if not st["channels"]:
         return await event.respond("Список пуст.")
-    body = "\n".join(f"{i+1}. {c}" for i,c in enumerate(st["channels"]))
+    body = "\n".join(f"{i+1}. {c}" for i, c in enumerate(st["channels"]))
     await event.respond(f"Каналы:\n{body}")
 
 @bot_client.on(events.NewMessage(pattern=r'^/remove_channel\s+(\d+)$'))
@@ -369,9 +420,9 @@ async def cmd_set_reply(event):
     st = load_state()
     if not is_owner(st, event.sender_id):
         return await event.respond("Только владелец может управлять.")
-    txt = event.pattern_match.group(1)
+    txt = event.pattern_match.group(1).strip()
     async with state_lock:
-        st["reply_text"] = txt
+        st["reply_text"] = txt or DEFAULT_REPLY
         await save_state(st)
     await event.respond("Шаблон отклика обновлён ✅")
 
@@ -385,17 +436,17 @@ async def cmd_status(event):
         f"Включено: {st['enabled']}\n"
         f"Каналы:\n{ch}\n"
         f"Задержка: {MIN_DELAY}-{MAX_DELAY} c\n"
-        f"Gemini: {'ON' if GEMINI_ENABLED else 'OFF'}"
+        f"Gemini: {'ON' if GEMINI_ENABLED else 'OFF'}\n"
+        f"Админы: {', '.join(map(str, ADMIN_IDS)) or 'нет'}"
     )
 
-# ------------------ Старт обоих клиентов ------------------
+# -------- Старт --------
 async def main():
     log.info("=== CONFIG ===")
     log.info(f"Delay: {MIN_DELAY}-{MAX_DELAY}s | VERBOSE={VERBOSE}")
     log.info(f"Sessions dir: {SESSIONS_DIR} | USER={USER_SESSION} | BOT={BOT_SESSION}")
     log.info(f"State: {STATE_FILE}")
     log.info(f"Gemini: {'ON' if GEMINI_ENABLED else 'OFF'}")
-    # стартуем бота и юзера
     await bot_client.start(bot_token=BOT_TOKEN)
     await user_client.start()
     await resolve_channels()
