@@ -36,6 +36,26 @@ TELETHON_SESSION_B64 = os.getenv("TELETHON_SESSION_B64", "").strip()
 MIN_DELAY = max(0, int(os.getenv("MIN_DELAY", "1")))
 MAX_DELAY = max(MIN_DELAY, int(os.getenv("MAX_DELAY", "15")))
 VERBOSE   = os.getenv("VERBOSE", "0").lower() in {"1","true","yes"}
+# --- ключевые слова и стоп-слова (жёстко в коде) ---
+KEYWORDS: list[str] = [
+    # русские
+    "анимация", "аниматор", "анимации",
+    "моушн", "моушн дизайнер", "графика",
+    "видео", "монтаж", "креатор", "ai креатор",
+    "2d", "3d", "rig", "rigging", "explainer",
+    # английские
+    "motion", "ai", "ai creator", "creator",
+    "runway", "midjourney", "blender",
+    "c4d", "cinema 4d", "after effects", "ae",
+]
+
+NEGATIVE_WORDS: list[str] = [
+    # посты «я ищу работу/клиентов/сделаю» — отсекаем
+    "ищу работу", "ищу заказ", "ищу заказы", "ищу клиентов",
+    "исполнитель", "портфолио", "стажировка",
+    "готов выполн", "резюме", "выполню", "сделаю",
+    "предлагаю услуги",
+]
 
 # Админы (через запятую): ADMIN_IDS=111,222
 ADMIN_IDS: Set[int] = {
