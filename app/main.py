@@ -78,14 +78,17 @@ KEYWORDS = [
     "ищу моушн дизайнера", "в поиске моушн дизайнера",
     "проектная задача", "2d аниматор",
     "moho", "toon boom специалист",
-    "after effects", "монтажёр", "удаленная работа",
+    "after effects", "монтажёр", "монтажер", "удаленная работа",
     "ии контент", "ии специалист",
+    # ai-видео / ролики
+    "ии ролик", "ai ролик", "ai видео", "генерация видео",
     # расширения/синонимы
     "motion designer", "motion-дизайнер", "моушн", "мошн",
     "анимация", "3d анимация", "2d анимация",
     "c4d", "cinema 4d", "blender", "ae",
     "эксплейнер", "аниматор", "motion graphics", "vfx",
     "композинг", "ролик", "shorts", "reels", "инфографика",
+    "3d motion designer", "3d motion дизайнер",
     # маркеры заявки/задачи
     "бюджет", "сроки", "бриф", "тз", "оплата", "рейты",
     "стоимость", "контракт", "коммерческое предложение", "нужен", "требуется",
@@ -128,6 +131,7 @@ STATE_DEFAULT: Dict[str, Any] = {
     "keywords": DEFAULT_KEYWORDS,
     "negative_words": DEFAULT_NEGATIVE_WORDS,
     "tap": False,               # присылать отчёты по каждому сообщению владельцу
+    "media_files": [],          # до 3 файлов для прикрепления к отклику
 }
 AUDIT_FILE = "./data/audit.jsonl"  # JSONL-файл с решениями
 
@@ -179,12 +183,18 @@ def _parse_terms(blob: str) -> List[str]:
     x = blob.replace(",", "\n").replace(";", "\n")
     return _dedup_keep_order([p for p in x.splitlines() if p.strip()])
 
+KEYWORDS_NORM: List[str] = []
+NEGATIVE_WORDS_NORM: List[str] = []
+
 def refresh_globals_from_state():
-    """Подтянуть KEYWORDS/NEGATIVE_WORDS из state.json в рантайм."""
-    global KEYWORDS, NEGATIVE_WORDS
+    """Подтянуть KEYWORDS/NEGATIVE_WORDS из state.json в рантайм и нормализовать."""
+    global KEYWORDS, NEGATIVE_WORDS, KEYWORDS_NORM, NEGATIVE_WORDS_NORM
     st = load_state()
     KEYWORDS = _dedup_keep_order(st.get("keywords", DEFAULT_KEYWORDS))
     NEGATIVE_WORDS = _dedup_keep_order(st.get("negative_words", DEFAULT_NEGATIVE_WORDS))
+    # предрассчёт нормализованных списков для корректного сопоставления (ё→е, регистр)
+    KEYWORDS_NORM = [norm(k) for k in KEYWORDS]
+    NEGATIVE_WORDS_NORM = [norm(k) for k in NEGATIVE_WORDS]
 
 # ---- Аудит файл ----
 def _write_audit_sync(entry: Dict[str, Any]):
@@ -278,7 +288,7 @@ REQ_VERBS = re.compile(
 def primary_pass(text: str) -> bool:
     """Есть ключевое слово и глагол запроса (а не просто болтовня)."""
     t = norm(text)
-    if not any(k in t for k in KEYWORDS):
+    if not any(k in t for k in KEYWORDS_NORM):
         return False
     if not REQ_VERBS.search(t):
         return False
@@ -286,7 +296,7 @@ def primary_pass(text: str) -> bool:
 
 def negative_pass(text: str) -> bool:
     t = norm(text)
-    return any(n in t for n in NEGATIVE_WORDS)
+    return any(n in t for n in NEGATIVE_WORDS_NORM)
 
 async def openai_gate(text: str) -> bool:
     """Строгая двоичная проверка через OpenAI. True — это заказ (клиент ищет исполнителя)."""
@@ -340,8 +350,20 @@ async def ensure_join(link_or_at: str) -> Optional[int]:
             hash_ = link.split("t.me/")[-1]
             hash_ = hash_.split("+", 1)[-1] if "+" in hash_ else hash_.rsplit("/", 1)[-1]
             try:
-                await user_client(ImportChatInviteRequest(hash_))
+                res = await user_client(ImportChatInviteRequest(hash_))
             except UserAlreadyParticipantError:
+                res = None
+            # попытаться получить peer_id из ответа/диалогов
+            try:
+                if res and getattr(res, "chats", None):
+                    for ch in res.chats:
+                        try:
+                            return int(get_peer_id(ch))
+                        except Exception:
+                            continue
+                # запасной вариант: после импорта получить последний диалог по ссылке нельзя,
+                # поэтому просто резолвим текущие чаты позже
+            except Exception:
                 pass
             return None
         elif link.startswith("https://t.me/"):
@@ -451,7 +473,19 @@ async def watcher(event):
             await asyncio.sleep(delay)
             try:
                 reply_text = str(st.get("reply_text") or DEFAULT_REPLY)
-                await user_client.send_message(target, reply_text)  # type: ignore[arg-type]
+                media_files = list((st.get("media_files") or [])[:3])
+                if media_files:
+                    # Отправляем первый файл с подписью, остальные без
+                    first, rest = media_files[0], media_files[1:]
+                    await user_client.send_file(target, first, caption=reply_text)  # type: ignore[arg-type]
+                    for mf in rest:
+                        try:
+                            await user_client.send_file(target, mf)  # type: ignore[arg-type]
+                            await asyncio.sleep(0.5)
+                        except Exception:
+                            continue
+                else:
+                    await user_client.send_message(target, reply_text)  # type: ignore[arg-type]
                 final = "sent"
                 if st.get("owner_id"):
                     who = target if isinstance(target, str) else f"id:{target}"
@@ -849,6 +883,86 @@ async def cmd_show(event):
         f"{row.get('preview')}"
     )
     await event.respond(txt)
+
+# ===== Медиа-файлы для прикрепления к отклику =====
+@bot_client.on(events.NewMessage(pattern=r"^/add_media\s+([\s\S]+)$"))
+async def cmd_add_media(event):
+    st = load_state()
+    if not is_owner(st, event.sender_id):
+        return await event.respond("Только владелец может управлять.")
+    # допускаем до 3 файлов (локальные пути или http/https)
+    items = _parse_terms(event.pattern_match.group(1))
+    if not items:
+        return await event.respond("Формат: /add_media url1;url2;path3")
+    async with state_lock:
+        cur = list(st.get("media_files", []))
+        for it in items:
+            if len(cur) >= 3:
+                break
+            if it not in cur:
+                cur.append(it)
+        st["media_files"] = cur[:3]
+        await save_state(st)
+    await event.respond(f"Файлы обновлены ({len(st['media_files'])}/3). Использую при отклике.")
+
+@bot_client.on(events.NewMessage(pattern=r"^/list_media$"))
+async def cmd_list_media(event):
+    st = load_state()
+    if not is_owner(st, event.sender_id):
+        return await event.respond("Только владелец может управлять.")
+    media = st.get("media_files", [])
+    if not media:
+        return await event.respond("Медиа не заданы.")
+    body = "\n".join(f"- {m}" for m in media)
+    await event.respond("Медиа (до 3):\n" + body)
+
+@bot_client.on(events.NewMessage(pattern=r"^/clear_media$"))
+async def cmd_clear_media(event):
+    st = load_state()
+    if not is_owner(st, event.sender_id):
+        return await event.respond("Только владелец может управлять.")
+    async with state_lock:
+        st["media_files"] = []
+        await save_state(st)
+    await event.respond("Медиа очищены ✅")
+
+# ===== Экспорт аудита в Excel =====
+@bot_client.on(events.NewMessage(pattern=r"^/export_xlsx$"))
+async def cmd_export_xlsx(event):
+    st = load_state()
+    if not is_owner(st, event.sender_id):
+        return
+    try:
+        import openpyxl  # type: ignore
+        from openpyxl.utils import get_column_letter  # type: ignore
+    except Exception:
+        return await event.respond("openpyxl не установлен. Установите пакет и повторите.")
+
+    rows = await read_tail(10000)  # экспортируем последние 10k записей
+    if not rows:
+        return await event.respond("Аудит пуст.")
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "audit"
+    headers = [
+        "key", "chat_id", "chat_title", "preview", "primary", "negative",
+        "used_openai", "openai_ok", "decision", "reason", "target", "send_error", "delay", "ts",
+    ]
+    ws.append(headers)
+    for r in rows:
+        ws.append([r.get(h) for h in headers])
+    # автоширина
+    for idx, _ in enumerate(headers, 1):
+        ws.column_dimensions[get_column_letter(idx)].width = 18
+
+    ensure_dirs()
+    out_path = os.path.join(os.path.dirname(AUDIT_FILE) or ".", "audit.xlsx")
+    wb.save(out_path)
+    try:
+        await bot_client.send_file(event.chat_id, out_path)
+    except Exception:
+        return await event.respond(f"Сохранено: {out_path}")
 
 # ================== Старт ==================
 async def main():
